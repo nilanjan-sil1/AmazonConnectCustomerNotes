@@ -1,6 +1,10 @@
 # Approach to Secure Connection from Amazon Connect Customer to Pindrop
 
-The key architectural constraint is that Lambda never talks to Pindrop directly over the open internet — everything funnels through a single, tightly governed "secure gateway" hop (AWS PrivateLink to Pindrop's VPC endpoint service where available, or an allow-listed egress path via a shared network account). Here's how that maps onto AWS infrastructure:A few things worth calling out on the security path, since that's the part unique to a protected account:
+The key architectural constraint is that Lambda never talks to Pindrop directly over the open internet — everything funnels through a single, tightly governed "secure gateway" hop (AWS PrivateLink to Pindrop's VPC endpoint service where available, or an allow-listed egress path via a shared network account). Here's how that maps onto AWS infrastructure:
+
+<img width="1440" height="1120" alt="image" src="https://github.com/user-attachments/assets/efa4fd7a-1bc0-47e5-b6e8-c8dfbae9d852" />
+
+A few things worth calling out on the security path, since that's the part unique to a protected account:
 
 **Two ways to reach Pindrop without opening general internet access:**
 1. **AWS PrivateLink** — if Pindrop exposes a VPC Endpoint Service (they do for enterprise/regulated deployments), you create an interface endpoint in the egress account and traffic never leaves the AWS backbone. This is the cleanest option — no NAT, no public IPs, no DNS exfiltration risk.
@@ -25,8 +29,8 @@ The Lambda is the only thing in the flow that speaks HTTPS to the outside world.
 
 1. **Receive the invocation payload** — Connect automatically passes the full flow run data (ContactId, customer endpoint/ANI, any contact attributes set so far) to the function, plus whatever specific parameters you configure in `LambdaInvocationAttributes`.
 2. **Retrieve Pindrop credentials** from Secrets Manager (the credential-security piece from earlier).
-3. **Call Pindrop's API** — for the auth path, sending the ANI/phoneprint data to Passport; separately, kicking off or checking status of the Protect scoring pipeline that's consuming the KVS audio.
-4. **Parse and flatten the response** — Connect requires the Lambda's return value to be either a flat `STRING_MAP` (key/value pairs of strings) or nested `JSON`, set statically per block. Since Pindrop's raw API response likely has nested structure, the Lambda's job is to shape that into whatever `ResponseValidation` type you configured, exposed to the flow under the `$.External` namespace.
+3. **Call Pindrop's API** — for the auth path, sending the ANI/phoneprint data to Passport; separately, kicking off or checking the status of the Protect scoring pipeline that's consuming the KVS audio.
+4. **Parse and flatten the response** — Connect requires the Lambda's return value to be either a flat `STRING_MAP` (key/value pairs of strings) or nested `JSON`, set statically per block. Since Pindrop's raw API response likely has a nested structure, the Lambda's job is to shape that into whatever `ResponseValidation` type you configured, exposed to the flow under the `$.External` namespace.
 5. **Respect Connect's tight timeout window** — this is the constraint that shapes the whole design: synchronous invocation caps out at **8 seconds max**, asynchronous at 60 seconds. Since Protect's real-time scoring is a streaming, ongoing process rather than an instant response, you can't just call it synchronously and wait — this is exactly why the earlier design used a **pending/loop/timeout pattern**: the Lambda kicks off the request and returns quickly, and the flow polls a `Check contact attributes` loop against a status attribute rather than blocking on one long call.
 6. **Handle retries and errors gracefully** — Connect already retries throttled or 500-error Lambda invocations up to three times automatically, but the Lambda itself still needs application-level error handling for Pindrop-side failures (timeout, invalid response, service unavailable) so it returns a clean "auth unavailable" signal rather than crashing the block and dumping the caller onto a bare Error branch.
 7. **Write results back as attributes** — since any external attribute is overwritten the moment you invoke a different Lambda function, this function's output must be immediately captured into user-defined attributes via a **Set contact attributes** block if anything downstream (screen pop, another Lambda call, risk branching) needs to reference it later.
@@ -90,7 +94,7 @@ Credential handling here follows a fairly standard AWS pattern, with a couple of
 - The Lambda reaches Secrets Manager over a **VPC interface endpoint**, so that call also never leaves the AWS network, consistent with the rest of the architecture.
 
 **Rotation**
-- Secrets Manager's automatic rotation feature can call a rotation Lambda on a schedule (e.g. every 30–90 days) that requests a new key/secret from Pindrop's admin API (if they support programmatic rotation) or at minimum alerts your team to rotate manually and updates the stored value.
+- Secrets Manager's automatic rotation feature can call a rotation Lambda on a schedule (e.g. every 30–90 days) that requests a new key/secret from Pindrop's admin API (if they support programmatic rotation) or, at minimum, alerts your team to rotate manually and updates the stored value.
 - Rotation should be tested against Pindrop's actual auth model — some vendors use static API keys, others use OAuth client-credentials flows with short-lived tokens. If it's OAuth, Lambda caches the access token (with its own short TTL) rather than re-authenticating on every call, and the long-lived client secret is what sits in Secrets Manager.
 
 **Least privilege**
@@ -111,7 +115,7 @@ I need to correct something significant from earlier in this conversation before
 That means the "Pulse gets a batch S3 export at end of call" pattern I described earlier isn't grounded in anything I can confirm — I was pattern-matching to a generic vendor-analytics assumption rather than Pindrop's actual product.
 
 **What I can honestly say gets stored in S3 in this architecture:**
-- **Call recordings** (from Amazon Connect's own recording feature) — the standard compliance artifact, encrypted with your KMS key, used for QA, dispute resolution, and regulatory retention requirements.
+- **Call recordings** (from Amazon Connect's own recording feature) — the standard compliance artefact, encrypted with your KMS key, used for QA, dispute resolution, and regulatory retention requirements.
 - **Contact Trace Records (CTRs)** — Connect's structured metadata about each contact (timestamps, queue, agent, disposition, and any contact attributes you chose to persist, including your `AuthStatus`, `RiskScore`, and now presumably a `LivenessScore` if you're using Pulse).
 - Possibly a **consolidated audit log** you build yourself — joining the CTR with the Passport/Protect/Pulse scores at the time of the call, useful for after-the-fact fraud investigation or model-performance review, but this would be your own construction, not something Pindrop directly consumes from S3.
 
