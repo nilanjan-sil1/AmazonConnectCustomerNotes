@@ -18,6 +18,26 @@ Each LOB's KVS stream is a resource that lives *in that LOB's own account* — C
 
 **One open decision I'd flag rather than assume:** whether all three LOBs share a single Pindrop contract/credential, or whether Pindrop issues separate client credentials per LOB (common if each LOB has a distinct fraud-consortium profile, billing relationship, or regulatory boundary — plausible for three genuinely separate lines of business). If it's the latter, the hub's Secrets Manager needs three scoped secrets rather than one, and the orchestrator selects the right credential based on the `lobId` in the incoming request — a small change to the contract, but worth deciding with your Pindrop account team before building the shared secret store as if there's only one relationship to manage.
 
+## More elaborate box diagram
+
+Good — let's pin these down concretely rather than leaving them as generic boxes.
+
+**The two main components, and what each actually is:**
+
+1. **The orchestrator** — the logic/control-plane layer. Not one service, but a small serverless stack: a **private API Gateway** as the entry point the three LOBs call into, backed by **AWS Step Functions** as the actual orchestrator, which invokes one or more **Lambda functions** to do the real work (call Passport, trigger the audio bridge, poll for Protect/Pulse completion, normalize the response, write results to DynamoDB).
+
+2. **The cross-account audio bridge** — the media/streaming layer. This is an **Amazon ECS task running on AWS Fargate**: a long-running container that holds an open connection to a LOB's KVS stream and to Pindrop's real-time ingestion endpoint for the duration of a call.
+
+**Is the orchestrator a "microservice"? Not in the classic always-on sense — and that's deliberate.**
+
+You could build it as a persistent microservice on ECS/Fargate behind an internal load balancer, but **Step Functions + Lambda is the more idiomatic AWS choice here**, for reasons specific to this workload:
+- The work is a **multi-step, mostly I/O-bound sequence** (call Passport → trigger audio scoring → poll for completion → aggregate → write result) — exactly the shape Step Functions is designed to coordinate, with built-in retry policies, timeout handling, and error branching per step rather than you hand-rolling that logic.
+- Traffic across three LOB contact centers is **spiky, not constant** — serverless (pay-per-invocation) avoids paying for idle capacity between calls, unlike a standing microservice that's provisioned for peak load at all times.
+- Step Functions gives you a **visual execution history per request** — genuinely valuable here since this whole hub exists to make fraud-relevant decisions; being able to pull up exactly which steps ran, in what order, with what inputs/outputs for any given `sessionId` is a real audit-trail asset your fraud/compliance team will eventually want.
+- No servers or containers to patch, scale, or right-size for the orchestration layer itself — Fargate is reserved for the one component that genuinely needs a persistent connection (the audio bridge), not applied everywhere out of habit.
+
+**Why the audio bridge specifically can't be serverless the same way:** as covered earlier, it needs to hold an open, continuous connection to KVS and to Pindrop for the full duration of a live call — that's fundamentally at odds with Lambda's execution-time ceiling, so Fargate (no server management, but a long-running container) is the right fit, while everything *around* it stays serverless.
+
 ## What does LOB A trigger Lambda actually send to the hub?
 
 This is where the "channel-agnostic contract" from the diagram becomes concrete. The trigger Lambda's job is entirely translation: it takes whatever Connect handed it and reshapes it into the hub's generic schema — nothing Connect-specific should leak through to the orchestrator.
