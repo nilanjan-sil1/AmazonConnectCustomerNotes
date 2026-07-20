@@ -7,9 +7,11 @@ Here's how these three Pindrop products typically slot into an Amazon Connect de
 - **Protect** does real-time fraud/risk scoring off the live audio stream — runs continuously in parallel with the call.
 - **Pulse** is post-call analytics/reporting — consumes call metadata and recordings asynchronously after the interaction ends.
 
+<img width="1440" height="756" alt="image" src="https://github.com/user-attachments/assets/f1d18e26-af51-4150-83a5-26c5cd376708" />
+
 ## Tell me more about the Amazon Connect contact flow
 
-The contact flow is where all the branching logic lives — it's the traffic controller that decides, in real time, what happens to the call based on what Passport and Protect report back.Walking through what each block actually does:
+The contact flow is where all the branching logic lives — it's the traffic controller that decides, in real time, what happens to the call based on what Passport and Protect report back. Walking through what each block actually does:
 
 **Call arrives** — the "Set logging behavior" and "Set voice" blocks typically run first, then the flow moves into media streaming setup. This is also where you'd set a whisper flow or initial DTMF/voice prompt if you want the caller to state a purpose before authentication starts.
 
