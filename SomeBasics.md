@@ -13,6 +13,8 @@ Here's how these three Pindrop products typically slot into an Amazon Connect de
 
 The contact flow is where all the branching logic lives — it's the traffic controller that decides, in real time, what happens to the call based on what Passport and Protect report back. Walking through what each block actually does:
 
+<img width="1440" height="1160" alt="image" src="https://github.com/user-attachments/assets/425f2019-f2ef-4bea-b5a2-8f98b692af11" />
+
 **Call arrives** — the "Set logging behavior" and "Set voice" blocks typically run first, then the flow moves into media streaming setup. This is also where you'd set a whisper flow or initial DTMF/voice prompt if you want the caller to state a purpose before authentication starts.
 
 **Start streaming, invoke Lambda** — two things happen close together: a **"Start media streaming"** block begins pushing audio to KVS, and an **"Invoke AWS Lambda function"** block calls your integration function, passing `$.ContactId`, `$.CustomerEndpoint.Address` (the ANI), and any DTMF-entered ID. The Lambda kicks off the Passport request and returns immediately with a "pending" or cached status — it doesn't block the caller waiting on Pindrop's response if that would add noticeable latency.
