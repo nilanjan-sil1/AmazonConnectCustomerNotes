@@ -1,9 +1,17 @@
 # Architecture where you have multiple Line of Business (LoB) integrations with a single Pindrop instance
 
-This is a genuinely different architectural problem from what we've discussed so far — you're not integrating one Connect instance with Pindrop, you're integrating *three*, and the constraint is that the Pindrop-specific logic can't be duplicated (and drift) three times across LOBs. The right pattern is to extract a **central, channel-agnostic Pindrop orchestration service** that every LOB's Connect flow calls through a thin, in-account adapter — the same hub-and-spoke thinking we used for network egress, now applied one layer up to the integration logic itself.Notice each LOB's local Lambda is deliberately "dumb" — it only knows how to talk to Connect and forward a normalized request onward. All the Pindrop-specific knowledge (API shapes, credentials, response parsing, scoring thresholds) lives in exactly one place. Here's how that maps to account topology:A few design decisions that make this actually work in practice, rather than just look clean on paper:
+This is a genuinely different architectural problem from what we've discussed so far — you're not integrating one Connect instance with Pindrop, you're integrating *three*, and the constraint is that the Pindrop-specific logic can't be duplicated (and drift) three times across LOBs. The right pattern is to extract a **central, channel-agnostic Pindrop orchestration service** that every LOB's Connect flow calls through a thin, in-account adapter — the same hub-and-spoke thinking we used for network egress, now applied one layer up to the integration logic itself.
+
+<img width="1440" height="778" alt="image" src="https://github.com/user-attachments/assets/b188c800-df27-43aa-b160-7e091ca93391" />
+
+Notice that each LOB's local Lambda is deliberately "dumb" — it only knows how to talk to Connect and forward a normalised request. All the Pindrop-specific knowledge (API shapes, credentials, response parsing, scoring thresholds) lives in exactly one place. Here's how that maps to account topology:
+
+<img width="1440" height="960" alt="image" src="https://github.com/user-attachments/assets/6556686e-7f15-4388-b9ac-01b618b4c5d7" />
+
+A few design decisions that make this actually work in practice, rather than just look clean on paper:
 
 **Why the local Lambda has to exist at all, not just call the hub directly**
-Amazon Connect's "Invoke AWS Lambda function" block can only target functions in the same AWS account — there's no native cross-account Lambda selection in the contact flow designer. So each LOB needs at least a thin local Lambda as the Connect-facing surface; its entire job is to receive the Connect invocation, normalize it into a shared request shape, and forward it to the hub. It should contain essentially zero Pindrop-specific logic — no scoring thresholds, no response parsing — so that when Pindrop changes their API or you add a fourth LOB, nothing in this local function needs to change.
+Amazon Connect's "Invoke AWS Lambda function" block can only target functions in the same AWS account — there's no native cross-account Lambda selection in the contact flow designer. So each LOB needs at least a thin local Lambda as the Connect-facing surface; its entire job is to receive the Connect invocation, normalise it into a shared request shape, and forward it to the hub. It should contain essentially zero Pindrop-specific logic — no scoring thresholds, no response parsing — so that when Pindrop changes their API or you add a fourth LOB, nothing in this local function needs to change.
 
 **How the cross-account call actually gets made securely**
 Two realistic options, and given the security posture you established earlier, the PrivateLink-style approach is the better fit:
