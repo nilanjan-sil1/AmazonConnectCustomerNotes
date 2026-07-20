@@ -1,6 +1,6 @@
 # Basics about Amazon Connect Contact Flows integrated with Pindrop Voice Biometrics and Protect Fraud Detection
 
-Here's how these three Pindrop products typically slot into an Amazon Connect deployment, and how to reach Pindrop's cloud securely from a locked-down account.
+Here's how three Pindrop products, namely Pindrop Passport, Pindrop Protect and Pindrop Pulse, typically slot into an Amazon Connect deployment, and how to reach Pindrop's cloud securely from a locked-down account.
 
 **The three products play different roles in the call:**
 - **Passport** does voice/phone-based authentication (caller enrollment + verification) — called synchronously early in the flow.
