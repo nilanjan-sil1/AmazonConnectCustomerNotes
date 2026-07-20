@@ -46,6 +46,8 @@ You could build it as a persistent microservice on ECS/Fargate behind an interna
 
 **Why the audio bridge specifically can't be serverless the same way:** as covered earlier, it needs to hold an open, continuous connection to KVS and to Pindrop for the full duration of a live call — that's fundamentally at odds with Lambda's execution-time ceiling, so Fargate (no server management, but a long-running container) is the right fit, while everything *around* it stays serverless.
 
+<img width="1440" height="1040" alt="image" src="https://github.com/user-attachments/assets/48743331-4014-4980-b9db-0e103b942c25" />
+
 ## What does LOB A trigger Lambda actually send to the hub?
 
 This is where the "channel-agnostic contract" from the diagram becomes concrete. The trigger Lambda's job is entirely translation: it takes whatever Connect handed it and reshapes it into the hub's generic schema — nothing Connect-specific should leak through to the orchestrator.
