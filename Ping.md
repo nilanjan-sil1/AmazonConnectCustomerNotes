@@ -661,3 +661,218 @@ Add these to your `pom.xml`. The PingAM artifacts are typically available from t
 * **Performance** – The CTS query is issued for every authentication. In high-volume deployments consider caching the result for a short TTL.
 * **Cluster consistency** – CTS is the source of truth across a multi-instance PingAM deployment, so counts are cluster-accurate.
 * **Admin permissions** – `CoreTokenService` is injected by PingAM with admin privileges; no explicit `Subject.doAs` is required.
+
+```
+package com.acmebank.ciam.auth.nodes;
+
+import static org.forgerock.openam.auth.node.api.SharedStateConstants.UNIVERSAL_ID;
+
+import java.util.Collection;
+import java.util.List;
+import java.util.ResourceBundle;
+
+import javax.inject.Inject;
+
+import org.forgerock.json.JsonValue;
+import org.forgerock.openam.annotations.sm.Attribute;
+import org.forgerock.openam.auth.node.api.Action;
+import org.forgerock.openam.auth.node.api.Node;
+import org.forgerock.openam.auth.node.api.NodeProcessException;
+import org.forgerock.openam.auth.node.api.OutcomeProvider;
+import org.forgerock.openam.auth.node.api.TreeContext;
+import org.forgerock.openam.core.realms.Realm;
+import org.forgerock.openam.cts.CTSPersistentStore;
+import org.forgerock.openam.cts.api.filter.TokenFilter;
+import org.forgerock.openam.cts.api.filter.TokenFilterBuilder;
+import org.forgerock.openam.cts.exceptions.CoreTokenException;
+import org.forgerock.openam.sm.datalayer.api.query.PartialToken;
+import org.forgerock.openam.tokens.CoreTokenField;
+import org.forgerock.openam.tokens.TokenType;
+import org.forgerock.util.i18n.PreferredLocales;
+
+import com.google.common.collect.ImmutableList;
+import com.google.inject.assistedinject.Assisted;
+import com.sun.identity.idm.AMIdentity;
+import com.sun.identity.idm.IdRepoException;
+import com.sun.identity.idm.IdUtils;
+import com.sun.identity.shared.debug.Debug;
+
+/**
+ * Authentication node that limits the number of concurrent live sessions for the
+ * authenticating user by querying the Core Token Service (CTS).
+ *
+ * <p>The node inspects the shared state for the user's universal ID (populated by an
+ * upstream identification node such as Data Store Decision or Inner Tree Evaluator),
+ * resolves it to an {@link AMIdentity} via {@link IdUtils}, and counts all live SESSION
+ * tokens currently persisted in CTS for that identity. Expired tokens are excluded
+ * automatically by CTS query semantics.
+ *
+ * <h2>Outcomes</h2>
+ * <ul>
+ *   <li><b>success</b> - The number of live sessions is strictly below the configured
+ *       limit. The authentication flow may proceed (a new session will be created).</li>
+ *   <li><b>limitExhausted</b> - The user has reached (or exceeded) the configured
+ *       maximum number of parallel sessions. The authentication flow should be aborted.</li>
+ *   <li><b>error</b> - The session count could not be queried or any other error
+ *       occurred (e.g. universal ID not present, identity not resolvable, CTS failure).</li>
+ * </ul>
+ *
+ * <h2>Important note on stateless sessions</h2>
+ * Stateless sessions are not stored in CTS unless <em>Session Tracking</em> (a.k.a.
+ * Session Blacklist/Whitelist) is enabled in the realm. If your deployment uses
+ * stateless sessions without tracking, this node will report zero active sessions
+ * and the limit will never be enforced.
+ */
+@Node.Metadata(
+        outcomeProvider = ConcurrentSessionLimitNode.SessionLimitOutcomeProvider.class,
+        configClass = ConcurrentSessionLimitNode.Config.class,
+        tags = {"session"})
+public class ConcurrentSessionLimitNode implements Node {
+
+    private static final String BUNDLE = ConcurrentSessionLimitNode.class.getName().replace(".", "/");
+    private static final Debug DEBUG = Debug.getInstance("amAuth");
+
+    static final String SUCCESS_OUTCOME_ID = "success";
+    static final String LIMIT_EXHAUSTED_OUTCOME_ID = "limitExhausted";
+    static final String ERROR_OUTCOME_ID = "error";
+
+    private final Config config;
+    private final Realm realm;
+    private final CTSPersistentStore ctsPersistentStore;
+
+    /**
+     * Node configuration interface. Properties here drive the configuration UI
+     * rendered by the PingAM admin console.
+     */
+    public interface Config {
+
+        /**
+         * The maximum number of concurrent live sessions permitted for a single user.
+         *
+         * @return the configured limit. Defaults to {@code 1}.
+         */
+        @Attribute(order = 100, requiredValue = true)
+        default int maxParallelSessions() {
+            return 1;
+        }
+
+        /**
+         * When {@code true}, the count returned by CTS is reduced by one before being
+         * compared against {@link #maxParallelSessions()}. This is useful when the node
+         * is executed <em>after</em> the new session has already been persisted in CTS
+         * (e.g. when placed downstream of a Session Upgrade or Inner Tree Evaluator
+         * node that creates the session early).
+         *
+         * @return whether to subtract the current (being-established) session.
+         */
+        @Attribute(order = 200)
+        default boolean subtractCurrentSession() {
+            return true;
+        }
+    }
+
+    /**
+     * Guice constructs one instance of this node per configured node in the tree.
+     * {@code Config} is bound per-node via assisted injection; {@code Realm} and
+     * {@code CTSPersistentStore} are singletons bound by the AM core injector.
+     *
+     * @param config             the node's configuration, as set in the tree editor.
+     * @param realm              the realm the tree is executing in.
+     * @param ctsPersistentStore the CTS store handle, injected by AM's Guice module.
+     */
+    @Inject
+    public ConcurrentSessionLimitNode(@Assisted Config config, @Assisted Realm realm,
+            CTSPersistentStore ctsPersistentStore) {
+        this.config = config;
+        this.realm = realm;
+        this.ctsPersistentStore = ctsPersistentStore;
+    }
+
+    @Override
+    public Action process(TreeContext context) throws NodeProcessException {
+        String universalId = context.sharedState.get(UNIVERSAL_ID).asString();
+        if (universalId == null || universalId.isEmpty()) {
+            DEBUG.error("ConcurrentSessionLimitNode: no {} found in shared state for realm {}",
+                    UNIVERSAL_ID, realm.asPath());
+            return Action.goTo(ERROR_OUTCOME_ID).build();
+        }
+
+        AMIdentity identity;
+        try {
+            identity = IdUtils.getIdentity(universalId);
+            if (identity == null || !identity.isExists()) {
+                DEBUG.error("ConcurrentSessionLimitNode: identity {} does not resolve in realm {}",
+                        universalId, realm.asPath());
+                return Action.goTo(ERROR_OUTCOME_ID).build();
+            }
+        } catch (IdRepoException e) {
+            DEBUG.error("ConcurrentSessionLimitNode: failed to resolve identity {}", universalId, e);
+            return Action.goTo(ERROR_OUTCOME_ID).build();
+        }
+
+        int liveSessionCount;
+        try {
+            liveSessionCount = countLiveSessions(identity.getUniversalId());
+        } catch (CoreTokenException e) {
+            DEBUG.error("ConcurrentSessionLimitNode: CTS query failed for {}", universalId, e);
+            return Action.goTo(ERROR_OUTCOME_ID).build();
+        }
+
+        if (config.subtractCurrentSession() && liveSessionCount > 0) {
+            liveSessionCount -= 1;
+        }
+
+        if (DEBUG.messageEnabled()) {
+            DEBUG.message("ConcurrentSessionLimitNode: {} has {} live session(s), limit is {}",
+                    universalId, liveSessionCount, config.maxParallelSessions());
+        }
+
+        if (liveSessionCount < config.maxParallelSessions()) {
+            return Action.goTo(SUCCESS_OUTCOME_ID).build();
+        }
+        return Action.goTo(LIMIT_EXHAUSTED_OUTCOME_ID).build();
+    }
+
+    /**
+     * Counts live SESSION tokens in CTS belonging to the given universal ID.
+     *
+     * <p>Uses a partial (attribute-only) query returning just {@code TOKEN_ID}, so CTS
+     * doesn't have to serialize and ship full session blobs back to AM just to be
+     * counted and discarded. CTS only returns non-expired tokens for this query, so
+     * expired sessions are excluded without any extra filtering logic here.
+     *
+     * @param canonicalUniversalId the canonical universal ID as returned by {@link AMIdentity#getUniversalId()}.
+     * @return the number of live session tokens found.
+     * @throws CoreTokenException if the query against CTS fails.
+     */
+    private int countLiveSessions(String canonicalUniversalId) throws CoreTokenException {
+        TokenFilter filter = new TokenFilterBuilder()
+                .withAttribute(CoreTokenField.USER_ID, canonicalUniversalId)
+                .withAttribute(CoreTokenField.TOKEN_TYPE, TokenType.SESSION)
+                .returnAttribute(CoreTokenField.TOKEN_ID)
+                .build();
+
+        Collection<PartialToken> partialTokens = ctsPersistentStore.attributeQuery(filter);
+        return partialTokens.size();
+    }
+
+    /**
+     * Outcome provider for the node's three terminal outcomes. AM's UI localizes each
+     * outcome's display label via the node's resource bundle
+     * ({@code ConcurrentSessionLimitNode.properties} alongside this class), falling
+     * back to the raw outcome ID if no bundle entry is present.
+     */
+    public static class SessionLimitOutcomeProvider implements OutcomeProvider {
+
+        @Override
+        public List<Outcome> getOutcomes(PreferredLocales locales, JsonValue nodeAttributes) {
+            ResourceBundle bundle = locales.getBundleInPreferredLocale(BUNDLE,
+                    SessionLimitOutcomeProvider.class.getClassLoader());
+            return ImmutableList.of(
+                    new Outcome(SUCCESS_OUTCOME_ID, bundle.getString(SUCCESS_OUTCOME_ID)),
+                    new Outcome(LIMIT_EXHAUSTED_OUTCOME_ID, bundle.getString(LIMIT_EXHAUSTED_OUTCOME_ID)),
+                    new Outcome(ERROR_OUTCOME_ID, bundle.getString(ERROR_OUTCOME_ID)));
+        }
+    }
+}
+```
