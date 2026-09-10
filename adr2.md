@@ -353,3 +353,73 @@ sequenceDiagram
 ## Summary
 
 The recommended architecture keeps OPA as the sole **decision** authority over declarative, versioned, signed Rego; repurposes the proposed relational database as a **derived, reconciled read model** feeding the PIP rather than a decision sink; makes resource/constraint "discovery" an explicit PIP responsibility governed by a canonical input contract; and treats every decision as an auditable, replayable event independent of whether upstream volatile signal sources retain their own history. This avoids the row-explosion problem, uses OPA as intended, and gives the bank a single, governed enforcement and audit surface across all lines of business.
+
+Here's the concrete engineering build-out for ADR-002 — the components, the data flow, and the implementation decisions that make the "read model, not source of truth" property actually hold up under load and failure.
+
+## Component breakdown
+
+```
+SOR-1 ─┐
+SOR-2 ─┼─► Ingestion Adapters ─► Event Bus ─► Projectors ─► Read Store ─► Query API ─► PIP
+SOR-N ─┘        (per-SOR)        (Kafka)     (per-entity)   (Postgres)    (gRPC/REST)
+                                                   │
+                                            Reconciliation Job (scheduled, compares vs SOR)
+```
+
+**1. Ingestion Adapters (one per SOR, or per integration style)**
+- Three intake shapes, normalized to one internal envelope:
+  - **Event-driven SORs** (already publish domain events) → Kafka consumer, straight passthrough with schema validation.
+  - **Webhook-only SORs** → a thin receiver service that validates signature/HMAC, persists to an outbox table, then publishes to Kafka (transactional outbox pattern — avoids losing webhook payloads if Kafka is briefly unavailable).
+  - **API-only/legacy SORs (no push capability)** → a polling adapter (CDC where possible — Debezium against the SOR's DB if you're given read access, otherwise scheduled delta-pull against their API) that synthesizes events from diffs.
+- Every adapter emits a **normalized envelope**, regardless of source style:
+
+```json
+{
+  "event_id": "uuid",
+  "source_system": "core-savings-v3",
+  "source_event_id": "SOR-native-id-or-offset",
+  "entity_type": "product_entitlement",
+  "occurred_at": "2026-09-10T08:00:00Z",
+  "schema_version": "1.2",
+  "payload": { ... }
+}
+```
+`source_event_id` is what makes projection idempotent — see below.
+
+**2. Event Bus (Kafka)**
+- One topic per entity type (`entitlements`, `relationships`, `delegations`), partitioned by `subject_id` so all events for one subject land in order on one partition — this is what gives you causal ordering without a distributed lock.
+- Schema Registry (Avro/Protobuf) enforcing the envelope + payload contract; adapters can't publish a payload that doesn't validate against the registered schema version. This is your defense against a SOR silently changing its event shape and corrupting the graph.
+- Dead-letter topic per entity type for anything that fails validation or fails projection after retries — alerted on, not silently dropped.
+
+**3. Projectors (materializers)**
+- Stateless consumers, one per entity type, horizontally scalable by partition.
+- **Idempotency:** upsert keyed on `(source_system, source_event_id)` stored alongside the row; a replayed event is a no-op, not a duplicate insert. This is what lets you safely replay the whole topic from offset 0 to rebuild the store.
+- **Effective-dating, not overwrite:** an update doesn't `UPDATE` the row in place — it closes the prior row (`effective_to = occurred_at`) and inserts a new one (`effective_from = occurred_at`). This gives you "what was true as of date X" for free, which ADR-006's replay tooling depends on.
+- **Out-of-order handling:** compare incoming `occurred_at` against the current row's `effective_from`; if the event is older than what's already applied, it's a late/out-of-order event — apply it as a correction into history (insert between existing effective-dated rows) rather than as the new "current" state, and flag it for review if it changes a period that's already been used in a past decision.
+
+**4. Read Store**
+- Postgres is the right default (not a graph DB) — the query pattern from the PIP is "given subject_id + product_id, get current entitlements/relationships," which is a straightforward indexed lookup, not deep graph traversal. Add a graph DB only if you later need multi-hop delegation chains (A delegates to B who delegates to C) at query time; even then, consider a recursive CTE in Postgres before reaching for new infrastructure.
+- Indexes: `(subject_id, effective_from, effective_to)` per entity table, partial index `WHERE effective_to IS NULL` for "current state" queries (the hot path).
+- No mutable "current" column duplicated separately from history — current state is always `WHERE effective_to IS NULL`, so there's exactly one code path, not two representations that can drift from each other.
+
+**5. Query API (fronting the store, called only by the PIP)**
+- gRPC or internal REST, read-only, with response caching at the PIP per ADR-003's volatility classes (minutes for entitlements, seconds for delegation).
+- Exposes point-in-time queries too: `GetEntitlements(subject_id, as_of=timestamp)` — needed by the ADR-006 replay tool, not just "current" queries.
+
+**6. Reconciliation Job**
+- Scheduled batch (e.g., nightly per SOR, or continuous for high-change SORs) that pulls a full or delta snapshot from the SOR's own reporting/extract interface and diffs it against current-state rows in the read store by checksum per subject.
+- Discrepancies raise an alert with the diff, not an auto-correction beyond a configurable confidence threshold — silent auto-repair of an authorization store is its own risk; small drifts can auto-heal, large/systemic drift pages a human.
+- This job is also your safety net for adapters that failed silently (e.g., a webhook that never arrived) — it's the second, independent path to the same truth.
+
+## Tech stack summary
+
+| Layer | Choice | Why |
+|---|---|---|
+| Bus | Kafka | Ordering per partition key, replay from offset, DLQ support |
+| Schema governance | Confluent/Apicurio Schema Registry | Prevents silent contract drift from SORs |
+| Projectors | Kafka Streams / lightweight consumers (language-agnostic) | Horizontally scalable, stateless |
+| Store | Postgres (partitioned by subject range at scale) | Simple, well-understood, sufficient query shape |
+| CDC (legacy SORs) | Debezium | Standard, avoids bespoke polling code |
+| Reconciliation | Scheduled batch job (Airflow/similar) | Independent verification path |
+
+The property this whole design protects is the one from ADR-002: **the read store must be fully rebuildable by replaying the event log**, so at any point you can prove it holds nothing that isn't traceable back to a SOR event — that's the idempotent-upsert + effective-dating combination doing the work, not any single piece of infrastructure.
