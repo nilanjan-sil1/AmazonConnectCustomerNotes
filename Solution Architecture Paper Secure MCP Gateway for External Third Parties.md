@@ -541,3 +541,115 @@ OAuth 2.1 (draft), RFC 6749, 7636 (PKCE), 7591, 8414, 8693, 8705, 8707, 9126 (PA
 ### Appendix C: Glossary
 
 **AISP/PISP:** Account Information / Payment Initiation Service Provider. **BOLA:** Broken Object Level Authorisation. **CIAM:** Customer Identity and Access Management. **DPoP:** Demonstrating Proof-of-Possession. **FAPI:** Financial-grade API. **MCP:** Model Context Protocol. **PAR:** Pushed Authorization Requests. **PDP/PEP:** Policy Decision/Enforcement Point. **RAR:** Rich Authorization Requests. **SCA:** Strong Customer Authentication. **SM&CR:** Senior Managers and Certification Regime. **TPP:** Third-Party Provider.
+
+### Appendix D: Evaluation of PingGateway 2026 and PingAM 8.1.1
+
+### D.1 Verdict
+
+PingGateway 2026 with PingAM 8.1.1 can deliver the Gateway enforcement point and the OAuth authorisation server in this architecture, but it does not meet every requirement out of the box. Roughly two thirds of the requirements in Sections 6 to 12 are met by configuration. The remainder needs a decision, a proof of concept (PoC) or custom build before approval.
+
+Four gaps matter most:
+
+1. **DPoP.** Neither product's documentation I reviewed lists RFC 9449 support. mTLS-bound tokens are supported, so the bank can standardise on mTLS and accept that agent platforms without client certificates cannot connect.
+2. **Fine-grained tool authorisation.** Ping's MCP guidance points to PingOne Authorize, PingAuthorize, PingOne Protect and Advanced Identity Cloud for fine-grained control. PingAM's own policy engine can fill part of this role, but tool-level, parameter-level and consent-aware decisions need scripting or an external policy decision point.
+3. **Rich Authorization Requests (RAR).** PingAM 8.1 offers only initial support, classed as Technology Preview, so it is not yet suitable for production consent of regulated data.
+4. **Interface stability.** PingGateway's MCP filters and context are classed as Evolving and may change without notice, even in a minor release. This conflicts with the bank's change control unless versions are pinned and contract-tested.
+
+Ping's documentation states that the MCP gateway pattern works with other OAuth 2.1 authorisation servers, including PingAM. Its worked tutorials cover PingOne and Advanced Identity Cloud, and its PingFederate example is described as differing from the PingAM configuration.
+
+### D.2 Basis and limits of this evaluation
+
+This is a documentation review as at 23 November 2026, covering PingGateway 2026.x up to release 2026.9 and PingAM 8.1.1. Nothing here was tested. Items marked "not found" mean the pages I read did not list the capability, not that it is absent. Section D.6 turns each of these into a PoC test.
+
+### D.3 PingGateway 2026 as the MCP Gateway
+
+| Requirement from this paper | What the documentation says | Fit |
+| --- | --- | --- |
+| Gateway acts as OAuth resource server, publishes protected resource metadata (Section 7.4) | McpProtectionFilter registers static protected resource metadata at the well-known endpoint, adds a `resource_metadata` directive to `WWW-Authenticate`, and checks the token `aud` claim against a configured resource ID | Meets |
+| Reject tokens not issued for the Gateway; no passthrough (Section 7.4) | Audience check as above; token exchange filter available (RFC 8693, from release 2026.9) | Meets with configuration |
+| Token validation: introspection or signed JWT with JWKS | OAuth2ResourceServerFilter with introspection, stateless resolvers (including a PingAM-specific resolver) and access token caching | Meets |
+| Sender-constrained tokens (Section 7.1) | Certificate-bound tokens (RFC 8705) supported, with mTLS by client certificate or trusted header. DPoP not found in the supported-standards list | mTLS meets; DPoP gap |
+| Validate MCP messages and method allow-list (Section 12.1, layer 4) | McpValidationFilter validates message format, pins protocol versions 2025-06-18 and 2025-11-25, restricts origins and records metrics. It excludes `tools` schemas | Partial |
+| Per-tool argument schema validation (Section 8.1, step 4) | Not provided by the validation filter. Needs a scriptable filter, or enforcement in the internal MCP server | Gap, build |
+| Audit every call (Section 12.3) | McpAuditFilter writes MCP events to an audit service with JSON, syslog, JDBC and JMS handlers. Field coverage for customer pseudonym, consent ID and tool version is unconfirmed | Meets, verify fields |
+| Rate limits per TPP, tool and agent (Section 8.4) | ThrottlingFilter with default, mapped and scriptable policies | Meets with configuration |
+| Coarse-grained OAuth controls | Scope checks in the resource server filter, plus script-based scope rules | Meets |
+| Fine-grained policy decisions (Section 8.1) | Documented integrations with PingOne Authorize, PingAuthorize, PingOne Protect and AM policy enforcement | Meets if one is adopted |
+| Response Guard: field filtering, untrusted-data labelling (Section 12.1, layer 7) | McpContext exposes the server's JSON-RPC response to scripts from release 2026.6, but no built-in response-content control is documented | Gap, build |
+| Circuit breakers and fallback (Section 11.2) | CircuitBreakerFilter, load balancing and failover guidance, Prometheus metrics | Meets with configuration |
+| Kill switch (Section 11.3) | No dedicated feature found. Achievable through route conditions, scripted deny-lists or token revocation at the AS | Partial, build |
+| Streaming sessions | Server-sent events supported when streaming is enabled; SSE message types in McpContext need release 2026.6 or later | Meets with configuration |
+| Cryptographic assurance | FIPS 140-3 mode, HSM secret store, key rotation guidance | Meets |
+| UK Open Banking trust (Section 6.1) | FAPI 1.0 Baseline and Advanced profiles, plus filter chains for dynamic registration and a trusted directory. These are documented with Advanced Identity Cloud and IDM, so applicability to standalone PingAM needs confirming. No FAPI 2.0 support listed | Partial |
+
+### D.4 PingAM 8.1.1 as the authorisation server
+
+| Requirement from this paper | What the documentation says | Fit |
+| --- | --- | --- |
+| Authorisation code with PKCE | Supported | Meets |
+| PAR and signed request objects (Section 5.2, step 2) | PAR endpoint supported. Release 8.1.0 adds a setting aligning behaviour to RFC 9126 and RFC 9101, and an option to require `exp` in request objects | Meets |
+| Client authentication without secrets (Section 7.1) | JWT-profile and mutual TLS client authentication supported. Basic and form secrets must be disabled by policy | Meets with configuration |
+| Sender-constrained tokens | Certificate-bound tokens and an AM-specific JWK-based proof-of-possession method. DPoP not found | mTLS meets; DPoP gap |
+| Rich Authorization Requests (Section 8.3) | Initial support in 8.1.0, Technology Preview | Gap for production |
+| Resource indicators and audience restriction | An `aud` parameter on token exchange was added in 8.1.0. RFC 8707 `resource` support on the authorisation request not found. Audience can alternatively be set with next-generation access token modification scripts | Verify |
+| Internal token exchange (Section 5.2, step 6) | Token exchange with impersonation and delegation. Release 8.1.1 lets audience members introspect exchanged tokens | Meets |
+| Introspection and revocation | Introspection endpoint, JWT response per RFC 9701, revocation endpoint, refresh token controls | Meets |
+| Decoupled customer approval (Section 7.2) | Backchannel authentication with a dedicated endpoint and journey nodes (CIBA-style) | Meets |
+| SCA and step-up | Journeys with passkeys, push, OATH and risk signals. Release 8.1.0 adds transactional authentication journeys. Dynamic linking of amount and payee to the authentication code is not documented and needs design | Meets; dynamic linking to verify |
+| Customer consent and revocation dashboard (Section 8.3) | Remote consent and per-user application management endpoints exist. A bank-grade consent service with RAR-style detail likely sits outside AM | Partial |
+| TPP and software statement trust | Scripted dynamic client registration (since 8.0), software publisher and trusted JWT issuer configuration. Open DCR must stay disabled (AD3) | Meets with configuration |
+| Agent identity (Section 6.1) | AI agents as OAuth identities with delegated token exchange, in user, agent and autonomous modes (8.1.0). Release 8.1.1 adds DCR script methods for agent attributes when integrated with PingIDM. Designed mainly for first-party agents; external agent platforms need testing | Partial, verify |
+| Policy decision point (Section 8.1) | Policy sets, scripted conditions, policy cache (8.1.0). Not a policy-as-code engine such as OPA or Cedar | Partial |
+| Pairwise subject identifiers (Section 6.2) | Not confirmed in the pages reviewed | Verify |
+| Audit and resilience (Section 11) | Audit logging, Prometheus metrics, multi-site deployment, FIPS 140-3 mode | Meets |
+
+### D.5 Gaps and recommended mitigations
+
+| Gap | Impact | Recommended mitigation |
+| --- | --- | --- |
+| No DPoP | Agent platforms without client certificates cannot get sender-constrained tokens | Require mTLS for Phase 1 (regulated TPPs hold OB certificates). Ask Ping for DPoP roadmap dates; do not issue unbound bearer tokens for T2 or higher |
+| RAR is Technology Preview | Consent detail limited to scopes, weakening purpose-bound consent | Use fine-grained scopes per tool and data cluster in Phase 1, with the bank's consent service as source of truth. Re-evaluate at the next PingAM release |
+| Tool-level and parameter-level policy | Entitlement checks per TPP, tool and account are not native | Adopt a PDP: PingAuthorize or PingOne Authorize if the bank licenses them, otherwise OPA or Cedar called from a PingGateway scriptable filter, with a signed fallback bundle (AD9) |
+| Tool argument and response controls | Schema validation and Response Guard are not provided | Build as PingGateway scriptable filters, or validate in the internal MCP servers. Treat as in-scope engineering work |
+| Kill switch | No ready-made global, TPP and tool switch | Implement a signed deny-list read by a PingGateway filter, plus token revocation at PingAM. Test under Section 11.3 |
+| Evolving interfaces | MCP filters may change in a minor release | Pin versions, run contract tests in CI on each upgrade, negotiate a stability commitment in the support agreement |
+| Dynamic linking for payments | Phase 3 payment initiation not demonstrated | Design with PingAM transactional authorisation and prove in a PoC before Phase 3 funding |
+| MCP protocol version lag | Gateway supports two named MCP revisions | Keep the MCP specification watch (Section 17) and test each new revision before exposing it |
+
+### D.6 Proof-of-concept exit criteria
+
+1. A third-party client completes discovery, PAR, consent, mTLS-bound token issuance and a tool call end to end, with audience-restricted tokens (RFC 8707 or script-set `aud`).
+2. A replayed token from a different client certificate is rejected.
+3. Token exchange yields an internal token that the internal MCP server accepts and the external token does not.
+4. A per-tool entitlement and per-account consent decision is enforced, with the PDP offline using the signed fallback bundle.
+5. The audit record for one call contains TPP, client, agent instance, customer pseudonym, consent ID, tool and version, decision and policy version.
+6. The kill switch disables one TPP, one tool and all access within the target time, and in-flight streaming sessions end.
+7. An injection payload in a transaction description is neutralised by the response control before reaching the client.
+8. An upgrade of PingGateway to the next minor release passes the contract test suite.
+9. A failover of PingAM and PingGateway across regions stays within the impact tolerance in Section 11.1.
+
+### D.7 Commercial and regulatory notes
+
+- **Deployment model:** self-managed PingGateway and PingAM keep customer data in the bank's estate. A SaaS option (PingOne, Advanced Identity Cloud) would add an outsourcing arrangement assessed under PRA SS2/21, plus exit planning and, if designated, the critical third parties regime.
+- **Support:** the support agreement needs response times that match the important business service impact tolerances.
+- **Licensing:** confirm whether PingAuthorize, PingOne Authorize and PingOne Protect, which Ping's MCP guidance names for fine-grained control, are in scope and priced.
+
+### D.8 Sources
+
+Pages opened in full:
+
+- [PingGateway: MCP security gateway](https://docs.pingidentity.com/pinggateway/2026/mcp/index.html)
+- [PingGateway: McpProtectionFilter](https://docs.pingidentity.com/pinggateway/2026/reference/McpProtectionFilter.html)
+- [PingGateway: supported standards](https://docs.pingidentity.com/pinggateway/2026/reference/Standards.html)
+- [PingAM: New in AM 8.1.x](https://docs.pingidentity.com/pingam/release-notes/whats-new-8.1.html)
+
+Search extracts only, or navigation contents only:
+
+- [PingGateway: McpValidationFilter](https://docs.pingidentity.com/pinggateway/2026/reference/McpValidationFilter.html)
+- [PingGateway: McpAuditFilter](https://docs.pingidentity.com/pinggateway/2026/reference/McpAuditFilter.html)
+- [PingGateway: McpContext](https://docs.pingidentity.com/pinggateway/2026/reference/McpContext.html)
+- [PingGateway: What's new](https://docs.pingidentity.com/pinggateway/release-notes/whats-new.html)
+- [PingAM: Proof-of-possession](https://docs.pingidentity.com/pingam/8.1/am-oauth2/oauth2-proof-of-possession.html)
+- [PingAM: AI agents](https://docs.pingidentity.com/pingam/8.1/am-oauth2/ai-agents.html)
+- [PingAM: Supported standards](https://docs.pingidentity.com/pingam/8.1/am-reference/am-supported-standards.html)
+
